@@ -188,6 +188,9 @@ int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, 
 			if (len > USBBUFSIZE)
 				len = USBBUFSIZE;
 
+            for(i=0;i<len;i++)
+                DPRINTF("sent %d\n",*(pos+i));
+
 			DPRINTF("combined write of %d/%zd\n",len,writepos-pos);
 			ftdi_write_data(&ftdic, pos, len);
 			pos += len;
@@ -229,6 +232,7 @@ int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, 
 					break;
 
 				case PP_WRITE:
+                    data |= JTAGKEY_RD;
 					if (val & PP_TDI) {
 						data |= JTAGKEY_TDI;
 						DPRINTF("TDI\n");
