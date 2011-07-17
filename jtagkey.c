@@ -167,18 +167,33 @@ int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, 
 
 	/* Count reads */
 	for (i = 0; i < num; i++)
+        {
 		if (tr[i].cmdTrans == PP_READ)
+                {
+                        DPRINTF("read(0) at %d\n",i);
 			nread++;
+                }
+        }
 
 	/* Write combining */
-	if ((writepos-writebuf > sizeof(writebuf)-num) || (nread && writepos-writebuf)) {
+	if ((writepos-writebuf) > sizeof(writebuf)) {
 		unsigned char *pos = writebuf;
 		int len;
+                int num_reads = 0;
 
-		DPRINTF("writing %zd bytes due to %d following reads in %d chunks or full buffer\n", writepos-writebuf, nread, num);
+                for(i=0; i<(writepos-pos); i++)
+                {
+                        if(writebuf[i] && JTAGKEY_RD)
+                        {
+                                DPRINTF("read(1) at %d\n",i);
+                                num_reads++;
+                        }
+                }
+
+		DPRINTF("writing %zd bytes due to %d following reads in %d chunks or full buffer\n", writepos-writebuf, num_reads, num);
 		jtagkey_latency(BULK_LATENCY);
 
-		targ.num = writepos-pos;
+		targ.num = num_reads;
 		targ.buf = readbuf;
 		pthread_create(&reader_thread, NULL, &jtagkey_reader, &targ);
 
@@ -221,18 +236,29 @@ int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, 
 		/* Pad writebuf for read-commands in stream */
 		*writepos = last_data;
 		prev_data = last_data;
+			
+                data = 0x00;
+
+                //Since need to send read requests, check here for one
+                if(tr[i].cmdTrans == PP_READ)
+                {
+                        DPRINTF("add read request at %d\n",i);
+                        *writepos = JTAGKEY_RD;
+                        writepos++;
+                }
 
 		if (port == ppbase + PP_DATA) {
 			DPRINTF("data port\n");
 
-			data = 0x00;
 			switch(tr[i].cmdTrans) {
 				case PP_READ:
+                                        DPRINTF("Reading from PP_DATA: %d\n",i);
+                                        tr[i].Data.Byte = 0;
+                                        nread--;
 					ret = 0; /* We don't support reading of the data port */
 					break;
 
 				case PP_WRITE:
-                    data |= JTAGKEY_RD;
 					if (val & PP_TDI) {
 						data |= JTAGKEY_TDI;
 						DPRINTF("TDI\n");
@@ -277,7 +303,7 @@ int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, 
 			}
 		}
 
-		if ((tr[i].cmdTrans == PP_READ) || (*writepos != prev_data) || (i == num-1))
+		if ((*writepos != prev_data) || (i == num-1))
 			writepos++;
 	}
 
@@ -290,7 +316,7 @@ int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, 
 
 		jtagkey_latency(OTHER_LATENCY);
 
-		targ.num = writepos-writebuf;
+		targ.num = nread;
 		targ.buf = readbuf;
 		pthread_create(&reader_thread, NULL, &jtagkey_reader, &targ);
 		ftdi_write_data(&ftdic, writebuf, writepos-writebuf);
@@ -338,7 +364,7 @@ int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, 
 #endif
 
 					val = 0x00;
-					if ((data & JTAGKEY_TDO) && (last_write & PP_PROG))
+					if (data & JTAGKEY_TDO)
 						val |= PP_TDO;
 
 					if (~last_write & PP_PROG)
