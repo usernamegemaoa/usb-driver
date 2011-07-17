@@ -72,7 +72,7 @@ static int jtagkey_init(unsigned short vid, unsigned short pid, unsigned short i
 	c = 0x00;
 	ftdi_write_data(&ftdic, &c, 1);
 
-	if ((ret = ftdi_set_bitmode(&ftdic, JTAGKEY_TCK|JTAGKEY_TDI|JTAGKEY_TMS|JTAGKEY_OEn, BITMODE_SYNCBB))  != 0) {
+	if ((ret = ftdi_set_bitmode(&ftdic, JTAGKEY_TCK|JTAGKEY_TDI|JTAGKEY_TMS|JTAGKEY_LED, BITMODE_SYNCBB))  != 0) {
 		fprintf(stderr, "unable to enable bitbang mode: %d (%s)\n", ret, ftdi_get_error_string(&ftdic));
 		return ret;
 	}
@@ -125,280 +125,161 @@ static void jtagkey_state(unsigned char data) {
 	if (data & JTAGKEY_TMS)
 		fprintf(stderr,"TMS ");
 
-	if (data & JTAGKEY_VREF)
-		fprintf(stderr,"VREF ");
-	
 	fprintf(stderr,"\n");
 }
 #endif
 
-struct jtagkey_reader_arg {
-	int		num;
-	unsigned char	*buf;
-};
+struct parallelport_emu {
+        union {
+                unsigned char val;
+                struct databits {
+                        unsigned TDI : 1;
+                        unsigned TCK : 1;
+                        unsigned TMS : 1;
+                        unsigned CTRL : 1;
+                        unsigned PROG : 1;
+                        unsigned d5 : 1;
+                        unsigned d6 : 1;
+                        unsigned d7 : 1;
+                } bits;
+        } data;
+        union {
+                unsigned char val;
+                struct statusbits {
+                        unsigned b0 : 1;
+                        unsigned b1 : 1;
+                        unsigned b2 : 1;
+                        unsigned SENSE : 1;
+                        unsigned TDO : 1;
+                        unsigned b5 : 1;
+                        unsigned b6 : 1;
+                        unsigned b7 : 1;
+                } bits;
+        } status;
 
-static void *jtagkey_reader(void *thread_arg) {
-	struct jtagkey_reader_arg *arg = (struct jtagkey_reader_arg*)thread_arg;
-	int i;
+} pp;
 
-	i = 0;
-	DPRINTF("reader for %d bytes\n", arg->num);
-	while (i < arg->num) {
-		i += ftdi_read_data(&ftdic, arg->buf + i, arg->num - i);
-	}
-	
-	pthread_exit(NULL);
+
+unsigned char writebuf[USBBUFSIZE];
+int writepos = 0;
+unsigned char readbuf;
+
+static void jtagkey_run(unsigned char mustRead)
+{
+        jtagkey_latency(OTHER_LATENCY);
+        DPRINTF("--> write %d\n", writepos);
+        ftdi_write_data(&ftdic, writebuf, writepos);
+        writepos = 0;
+        if(mustRead)
+        {
+                DPRINTF("<-- read %d\n", 1);
+                ftdi_read_data(&ftdic, &readbuf, 1);
+        }
 }
 
-/* TODO: Interpret JTAG commands and transfer in MPSSE mode */
-int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, int ecpbase, int num) {
-	int ret = 0;
-	int i;
-	int nread = 0;
-	unsigned long port;
-	unsigned char val;
-	static unsigned char last_data = 0;
-	static unsigned char last_write = 0x00;
-	static unsigned char writebuf[USBBUFSIZE], *writepos = writebuf;
-	static unsigned char readbuf[USBBUFSIZE], *readpos;
-	unsigned char data, prev_data, last_cyc_write;
-	struct jtagkey_reader_arg targ;
-	pthread_t reader_thread;
+static void jtagkey_updatepp()
+{
+        //Emulate random hardware link of D6, BUSY and PE
+        pp.status.bits.b7 = !pp.data.bits.d6;
+        pp.status.bits.b5 = pp.data.bits.d6;
 
-	/* Count reads */
-	for (i = 0; i < num; i++)
+        //Emulate VREF
+        pp.status.bits.SENSE = !pp.data.bits.PROG;
+        pp.status.bits.TDO = !pp.data.bits.PROG;
+}
+
+int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, int ecpbase, int num) 
+{
+        int i;
+        unsigned long port;
+        unsigned char val;
+        unsigned char mustWrite = 0;
+
+        pp.data.val = 0;
+        pp.status.val = 0;
+
+        jtagkey_updatepp();
+
+        for(i=0; i<num; i++)
         {
-		if (tr[i].cmdTrans == PP_READ)
+                port = (unsigned long)tr[i].dwPort - ppbase;
+                val = tr[i].Data.Byte;
+
+                //Update pp registers
+                switch(port)
                 {
-                        DPRINTF("read(0) at %d\n",i);
-			nread++;
+                        case PP_DATA:
+                                DPRINTF("data port\n");
+                                switch(tr[i].cmdTrans)
+                                {
+                                        case PP_READ:
+                                                jtagkey_updatepp();
+                                                DPRINTF("< data-read %x\n",pp.data.val);
+                                                tr[i].Data.Byte = pp.data.val;
+                                                break;
+                                        case PP_WRITE:
+                                                pp.data.val = val;
+                                                mustWrite = 1;
+                                                break;
+                                }
+                                break;
+                        case PP_STATUS:
+                                DPRINTF("status port\n");
+                                switch(tr[i].cmdTrans)
+                                {
+                                        case PP_READ:
+                                                jtagkey_updatepp();
+                                                if(writepos > 0)
+                                                {
+                                                        writebuf[writepos-1] |= JTAGKEY_RD;
+                                                }
+                                                else
+                                                {
+                                                        writebuf[0] = JTAGKEY_RD;
+                                                        writepos++;
+                                                }
+                                                jtagkey_run(1);
+
+                                                if(readbuf & JTAGKEY_TDO)
+                                                        pp.status.bits.TDO = 1;
+                                                else
+                                                        pp.status.bits.TDO = 0;
+
+                                                DPRINTF("< status-read %x\n",pp.status.val);
+
+                                                tr[i].Data.Byte = pp.status.val;
+                                                break;
+                                        case PP_WRITE:
+                                                pp.status.val = val;
+                                                break;
+                                }
+                                break;
                 }
+
+                //Add to writebuf
+                if(mustWrite)
+                {
+                        unsigned char data = 0x00;
+                        if(pp.data.bits.TDI)
+                                data |= JTAGKEY_TDI;
+                        if(pp.data.bits.TCK)
+                                data |= JTAGKEY_TCK;
+                        if(pp.data.bits.TMS)
+                                data |= JTAGKEY_TMS;
+
+
+                        DPRINTF("> store-write %x of %x\n",data,pp.data.val);
+
+                        writebuf[writepos] = data;
+                        writepos++;
+
+                        mustWrite = 0;
+                }
+
+                if(writepos == (USBBUFSIZE-1))
+                        jtagkey_run(0);
         }
 
-	/* Write combining */
-	if ((writepos-writebuf) > sizeof(writebuf)) {
-		unsigned char *pos = writebuf;
-		int len;
-                int num_reads = 0;
 
-                for(i=0; i<(writepos-pos); i++)
-                {
-                        if(writebuf[i] && JTAGKEY_RD)
-                        {
-                                DPRINTF("read(1) at %d\n",i);
-                                num_reads++;
-                        }
-                }
-
-		DPRINTF("writing %zd bytes due to %d following reads in %d chunks or full buffer\n", writepos-writebuf, num_reads, num);
-		jtagkey_latency(BULK_LATENCY);
-
-		targ.num = num_reads;
-		targ.buf = readbuf;
-		pthread_create(&reader_thread, NULL, &jtagkey_reader, &targ);
-
-		while (pos < writepos) {
-			len = writepos-pos;
-
-			if (len > USBBUFSIZE)
-				len = USBBUFSIZE;
-
-            for(i=0;i<len;i++)
-                DPRINTF("sent %d\n",*(pos+i));
-
-			DPRINTF("combined write of %d/%zd\n",len,writepos-pos);
-			ftdi_write_data(&ftdic, pos, len);
-			pos += len;
-		}
-		pthread_join(reader_thread, NULL);
-
-		writepos = writebuf;
-	}
-
-	last_cyc_write = last_write;
-
-	for (i = 0; i < num; i++) {
-		DPRINTF("dwPort: 0x%lx, cmdTrans: %lu, dwbytes: %ld, fautoinc: %ld, dwoptions: %ld\n",
-				(unsigned long)tr[i].dwPort, tr[i].cmdTrans, tr[i].dwBytes,
-				tr[i].fAutoinc, tr[i].dwOptions);
-
-		port = (unsigned long)tr[i].dwPort;
-		val = tr[i].Data.Byte;
-
-#ifdef DEBUG
-		if (tr[i].cmdTrans == 13)
-			DPRINTF("write byte: %d\n", val);
-
-		if (tr[i].cmdTrans == 13)
-			jtagmon(val & PP_TCK, val & PP_TMS, val & PP_TDI);
-#endif
-
-		/* Pad writebuf for read-commands in stream */
-		*writepos = last_data;
-		prev_data = last_data;
-			
-                data = 0x00;
-
-                //Since need to send read requests, check here for one
-                if(tr[i].cmdTrans == PP_READ)
-                {
-                        DPRINTF("add read request at %d\n",i);
-                        *writepos = JTAGKEY_RD;
-                        writepos++;
-                }
-
-		if (port == ppbase + PP_DATA) {
-			DPRINTF("data port\n");
-
-			switch(tr[i].cmdTrans) {
-				case PP_READ:
-                                        DPRINTF("Reading from PP_DATA: %d\n",i);
-                                        tr[i].Data.Byte = 0;
-                                        nread--;
-					ret = 0; /* We don't support reading of the data port */
-					break;
-
-				case PP_WRITE:
-					if (val & PP_TDI) {
-						data |= JTAGKEY_TDI;
-						DPRINTF("TDI\n");
-					} else {
-						DPRINTF("!TDI\n");
-					}
-					if (val & PP_TCK) {
-						data |= JTAGKEY_TCK;
-						DPRINTF("TCK\n");
-					} else {
-						DPRINTF("!TCK\n");
-					}
-					if (val & PP_TMS) {
-						data |= JTAGKEY_TMS;
-						DPRINTF("TMS\n");
-					} else {
-						DPRINTF("!TMS\n");
-					}
-					if (val & PP_CTRL) {
-						data = JTAGKEY_OEn;
-						DPRINTF("CTRL\n");
-					} else {
-						DPRINTF("!CTRL\n");
-					}
-
-					if (val & PP_PROG) {
-						DPRINTF("PROG\n");
-					} else {
-						DPRINTF("!PROG\n");
-					}
-
-					*writepos = data;
-
-					last_data = data;
-					last_write = val;
-					break;
-
-				default:
-					fprintf(stderr,"!!!Unsupported TRANSFER command: %lu!!!\n", tr[i].cmdTrans);
-					ret = -1;
-					break;
-			}
-		}
-
-		if ((*writepos != prev_data) || (i == num-1))
-			writepos++;
-	}
-
-	if (nread)
-	{
-		DPRINTF("writing %zd bytes\n", writepos-writebuf);
-
-		*writepos = last_data;
-		writepos++;
-
-		jtagkey_latency(OTHER_LATENCY);
-
-		targ.num = nread;
-		targ.buf = readbuf;
-		pthread_create(&reader_thread, NULL, &jtagkey_reader, &targ);
-		ftdi_write_data(&ftdic, writebuf, writepos-writebuf);
-		pthread_join(reader_thread, NULL);
-
-#ifdef DEBUG
-		hexdump(writebuf, writepos-writebuf, "->");
-		hexdump(readbuf, i, "<-");
-#endif
-
-		writepos = writebuf;
-	} else {
-		return ret;
-	}
-
-	readpos = readbuf;
-	last_write = last_cyc_write;
-
-	for (i = 0; i < num; i++) {
-		DPRINTF("dwPort: 0x%lx, cmdTrans: %lu, dwbytes: %ld, fautoinc: %ld, dwoptions: %ld\n",
-				(unsigned long)tr[i].dwPort, tr[i].cmdTrans, tr[i].dwBytes,
-				tr[i].fAutoinc, tr[i].dwOptions);
-
-		port = (unsigned long)tr[i].dwPort;
-		val = tr[i].Data.Byte;
-
-		if ((tr[i].cmdTrans != PP_READ) && (val == last_write) && (i != num-1))
-			continue;
-
-		readpos++;
-
-		if (port == ppbase + PP_DATA) {
-			if (tr[i].cmdTrans == PP_WRITE) {
-				last_write = val;
-			}
-		} else if (port == ppbase + PP_STATUS) {
-			DPRINTF("status port (last write: 0x%x)\n", last_write);
-			switch(tr[i].cmdTrans) {
-				case PP_READ:
-					data = *readpos;
-
-#ifdef DEBUG
-					DPRINTF("READ: 0x%x\n", data);
-					jtagkey_state(data);
-#endif
-
-					val = 0x00;
-					if (data & JTAGKEY_TDO)
-						val |= PP_TDO;
-
-					if (~last_write & PP_PROG)
-						val |= 0x08;
-
-					if (last_write & 0x40)
-						val |= 0x20;
-					else
-						val |= 0x80;
-					break;
-
-				case PP_WRITE:
-					ret = 0; /* Status Port is readonly */
-					break;
-
-				default:
-					fprintf(stderr,"!!!Unsupported TRANSFER command: %lu!!!\n", tr[i].cmdTrans);
-					ret = -1;
-					break;
-			}
-		} else {
-			ret = 0;
-		}
-
-		tr[i].Data.Byte = val;
-
-		DPRINTF("dwPortReturn: 0x%lx, cmdTrans: %lu, dwbytes: %ld, fautoinc: %ld, dwoptions: %ld\n",
-				(unsigned long)tr[i].dwPort, tr[i].cmdTrans, tr[i].dwBytes,
-				tr[i].fAutoinc, tr[i].dwOptions);
-#ifdef DEBUG
-		if (tr[i].cmdTrans == 10)
-			DPRINTF("read byte: %d\n", tr[i].Data.Byte);
-#endif
-	}
-
-	return ret;
+        return 0;
 }
