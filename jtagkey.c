@@ -109,26 +109,6 @@ void jtagkey_close(int handle) {
 	}
 }
 
-#ifdef DEBUG
-static void jtagkey_state(unsigned char data) {
-	fprintf(stderr,"Pins high: ");
-
-	if (data & JTAGKEY_TCK)
-		fprintf(stderr,"TCK ");
-
-	if (data & JTAGKEY_TDI)
-		fprintf(stderr,"TDI ");
-
-	if (data & JTAGKEY_TDO)
-		fprintf(stderr,"TDO ");
-
-	if (data & JTAGKEY_TMS)
-		fprintf(stderr,"TMS ");
-
-	fprintf(stderr,"\n");
-}
-#endif
-
 struct parallelport_emu {
         union {
                 unsigned char val;
@@ -186,6 +166,8 @@ static void jtagkey_updatepp()
         //Emulate VREF
         pp.status.bits.SENSE = !pp.data.bits.PROG;
         pp.status.bits.TDO = !pp.data.bits.PROG;
+
+        DPRINTF("Status: %x Data: %x\n", pp.status.val, pp.data.val);
 }
 
 int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, int ecpbase, int num) 
@@ -195,10 +177,13 @@ int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, 
         unsigned char val;
         unsigned char mustWrite = 0;
 
-        pp.data.val = 0;
-        pp.status.val = 0;
-
         jtagkey_updatepp();
+
+        for(i=0; i<num; i++)
+        {
+                DPRINTF("> data: port:%d cmd: %x data: %x  #!#\n", tr[i].dwPort-ppbase, tr[i].cmdTrans, tr[i].Data.Byte);
+        }
+        
 
         for(i=0; i<num; i++)
         {
@@ -219,6 +204,7 @@ int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, 
                                                 break;
                                         case PP_WRITE:
                                                 pp.data.val = val;
+                                                jtagkey_updatepp();
                                                 mustWrite = 1;
                                                 break;
                                 }
@@ -251,6 +237,7 @@ int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, 
                                                 break;
                                         case PP_WRITE:
                                                 pp.status.val = val;
+                                                jtagkey_updatepp();
                                                 break;
                                 }
                                 break;
@@ -280,6 +267,11 @@ int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, 
                         jtagkey_run(0);
         }
 
+        for(i=0; i<num; i++)
+        {
+                DPRINTF("< data: port:%d cmd: %x data: %x  #!#\n", tr[i].dwPort-ppbase, tr[i].cmdTrans, tr[i].Data.Byte);
+        }
+        
 
         return 0;
 }
