@@ -141,13 +141,14 @@ struct parallelport_emu {
 
 
 unsigned char writebuf[USBBUFSIZE];
-int writepos = 0;
+unsigned long writepos = 0;
 unsigned char readbuf;
 
 static void jtagkey_run(unsigned char mustRead)
 {
         jtagkey_latency(OTHER_LATENCY);
         DPRINTF("--> write %d\n", writepos);
+        hexdump(writebuf, writepos, "");
         ftdi_write_data(&ftdic, writebuf, writepos);
         writepos = 0;
         if(mustRead)
@@ -179,10 +180,12 @@ int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, 
 
         jtagkey_updatepp();
 
+#ifdef DEBUG
         for(i=0; i<num; i++)
         {
                 DPRINTF("> data: port:%d cmd: %x data: %x  #!#\n", tr[i].dwPort-ppbase, tr[i].cmdTrans, tr[i].Data.Byte);
         }
+#endif
         
 
         for(i=0; i<num; i++)
@@ -263,14 +266,16 @@ int jtagkey_transfer(WD_TRANSFER *tr, int fd, unsigned int request, int ppbase, 
                         mustWrite = 0;
                 }
 
-                if(writepos == (USBBUFSIZE-1))
+                if(writepos == USBBUFSIZE)
                         jtagkey_run(0);
         }
 
+#ifdef DEBUG
         for(i=0; i<num; i++)
         {
                 DPRINTF("< data: port:%d cmd: %x data: %x  #!#\n", tr[i].dwPort-ppbase, tr[i].cmdTrans, tr[i].Data.Byte);
         }
+#endif
         
 
         return 0;
